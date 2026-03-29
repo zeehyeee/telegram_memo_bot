@@ -63,17 +63,27 @@ ANALYZE_SYSTEM_PROMPT = """
 - 변환 불가능한 힌트면 텍스트 그대로 (예: "다음 달 초")
 - 없으면 null
 
+【content】 내용 정제
+- 원문의 의미를 유지하되 자연스러운 문어체로 다듬기
+- 구어체/줄임말/감탄사 제거, 문장 완성도 높이기
+- "내일까지", "이번 주 안에", "3월 말" 등 날짜/기한 표현은 절대 포함하지 말 것 (목표일정 컬럼에 별도 저장됨)
+- 여러 항목이 있으면 줄바꿈으로 구분해서 정리
+- 예시:
+  원문: "캠페인 성과 정리해야함 ㅠㅠ 내일까지인데" →
+  content: "캠페인 성과 정리 필요"
+  원문: "바다 새싹보리 구매 (마트갈 때)" →
+  content: "바다 새싹보리 구매"
+
 【todos】 다음 액션 제안 (핵심!)
 - 메모 내용을 그대로 반복하지 말 것
-- 메모를 읽고 "그다음에 해야 할 일"을 1~3개 제안
+- 메모를 읽고 "그다음에 해야 할 일"을 최대 2개만 제안
 - 메모에 없는 새로운 관점의 액션이어야 함
-- 구체적이고 실행 가능한 동사로 시작할 것
+- 짧고 구체적으로, 실행 가능한 동사로 시작할 것
 - 예시:
   메모: "클로드로 아이디어 나래비 해보기" →
-  todos: ["AI 아이디어 중 빠르게 실행 가능한 것 1개 선정", "marketerlog 콘텐츠 소재로 연결되는지 검토"]
-  
+  todos: ["실행 가능한 아이디어 1개 선정", "marketerlog 소재 연결 검토"]
   메모: "내일까지 캠페인 보고서 작성" →
-  todos: ["지난 캠페인 데이터 취합", "보고서 초안 구조 잡기"]
+  todos: ["캠페인 데이터 취합", "보고서 초안 구조 잡기"]
 - 없으면 빈 배열 []
 
 ---
@@ -83,6 +93,7 @@ ANALYZE_SYSTEM_PROMPT = """
   "title": "핵심 한 줄 요약",
   "category": "업무|개인|아이디어",
   "target_date": "YYYY-MM-DD 또는 텍스트 또는 null",
+  "content": "정제된 내용",
   "todos": ["액션1", "액션2"]
 }
 """
@@ -106,11 +117,12 @@ def analyze_memo(text: str) -> dict:
             "title":       result.get("title", text[:30]),
             "category":    result.get("category", "개인"),
             "target_date": result.get("target_date"),
+            "content":     result.get("content", text),
             "todos":       result.get("todos", []),
         }
     except Exception as e:
         logger.error(f"Claude 분석 오류: {e}")
-        return {"title": text[:30], "category": "개인", "target_date": None, "todos": []}
+        return {"title": text[:30], "category": "개인", "target_date": None, "content": text, "todos": []}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -125,7 +137,8 @@ def save_to_notion(text: str, analysis: dict) -> bool:
         category   = analysis["category"]
         target_date= analysis["target_date"]
         todos      = analysis["todos"]
-        title      = analysis.get("title", text[:30])  # Claude가 요약한 제목
+        title      = analysis.get("title", text[:30])
+        content    = analysis.get("content", text)
         todos_text = "\n".join(f"• {t}" for t in todos) if todos else ""
 
         # 목표일정: 날짜 형식이면 date property, 텍스트면 rich_text
@@ -151,7 +164,7 @@ def save_to_notion(text: str, analysis: dict) -> bool:
                 "select": {"name": category}
             },
             "내용": {
-                "rich_text": [{"text": {"content": text}}]
+                "rich_text": [{"text": {"content": content}}]
             },
         }
 
@@ -234,21 +247,45 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # 아침 브리핑 (7:30 KST)
 # ─────────────────────────────────────────────────────────────
 async def send_morning_briefing(application: Application):
-    """오늘 날짜 기준 노션 메모 요약 브리핑"""
+    """오늘 날짜 기준 노션 메모 요약 + 마감 임박 알람"""
     try:
-        today = datetime.now(KST).strftime("%Y-%m-%d")
+        now_kst = datetime.now(KST)
+        today   = now_kst.strftime("%Y-%m-%d")
+        tomorrow = (now_kst + timedelta(days=1)).strftime("%Y-%m-%d")
 
+        # ── 마감 임박 항목 조회 (목표일정 = 오늘 or 내일) ──
+        deadline_pages = []
+        for target in [today, tomorrow]:
+            res = notion.databases.query(
+                database_id=NOTION_DATABASE_ID,
+                filter={"property": "목표일정", "date": {"equals": target}}
+            )
+            for page in res.get("results", []):
+                props = page["properties"]
+                title = props.get("구분", {}).get("title", [])
+                title = title[0]["text"]["content"] if title else "(내용 없음)"
+                deadline_pages.append((target, title))
+
+        # ── 오늘 저장된 메모 조회 ──
         response = notion.databases.query(
             database_id=NOTION_DATABASE_ID,
-            filter={
-                "property": "날짜",
-                "date": {"equals": today}
-            }
+            filter={"property": "날짜", "date": {"equals": today}}
         )
         pages = response.get("results", [])
 
+        lines = [f"☀️ {today} 아침 브리핑\n"]
+
+        # 마감 임박 섹션
+        if deadline_pages:
+            lines.append("🚨 마감 임박")
+            for target, title in deadline_pages:
+                tag = "오늘" if target == today else "내일"
+                lines.append(f"  • [{tag}] {title}")
+            lines.append("")
+
+        # 오늘 메모 섹션
         if not pages:
-            msg = f"📋 {today} 오늘 저장된 메모가 없어요."
+            lines.append("📋 오늘 저장된 메모가 없어요.")
         else:
             by_cat: dict[str, list[str]] = {"업무": [], "개인": [], "아이디어": []}
             for page in pages:
@@ -259,14 +296,14 @@ async def send_morning_briefing(application: Application):
                 title = title[0]["text"]["content"] if title else "(내용 없음)"
                 by_cat.setdefault(cat, []).append(title)
 
-            lines = [f"☀️ {today} 아침 브리핑\n"]
             emoji_map = {"업무": "💼", "개인": "🌿", "아이디어": "💡"}
             for cat, items in by_cat.items():
                 if items:
                     lines.append(f"{emoji_map.get(cat, '📝')} {cat} ({len(items)}건)")
                     for item in items:
                         lines.append(f"  • {item[:60]}")
-            msg = "\n".join(lines)
+
+        msg = "\n".join(lines)
 
         await application.bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
