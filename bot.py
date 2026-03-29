@@ -40,57 +40,77 @@ KST = timezone(timedelta(hours=9))
 # Claude API: 메모 분석 (분류 + 목표일정 + to-do 제안)
 # ─────────────────────────────────────────────────────────────
 ANALYZE_SYSTEM_PROMPT = """
-당신은 개인 비서봇을 위한 메모 분석 전문가입니다.
-사용자가 보내는 자연어 메모를 읽고 아래 JSON 형식으로만 응답하세요.
+당신은 CRM 마케터 지혜의 개인 비서입니다.
+사용자가 보내는 자연어 메모를 분석해 아래 JSON 형식으로만 응답하세요.
 절대 JSON 외 다른 텍스트를 포함하지 마세요.
 
-분류 기준 (category):
-- "업무": LG유플러스, CRM, 캠페인, 앱푸시, MMS, 데이터분석, 회사, 마케팅 전략, 보고서, KPI, MAU, 고객, 메시지 등 직장과 관련된 모든 것
-- "개인": 일상, 감정, 개인 목표, 운동, 건강, 가족, 남편, 고양이(바다), 여행, 취미, 집, 식사, 쇼핑 등 사생활과 관련된 것
-- "아이디어": 새로운 기획, 인사이트, marketerlog, 인스타그램 채널, 블로그, 창업, 자동화 아이디어, 부업, 툴 개발 아이디어 등
+---
 
-※ 분류 기준이 애매하거나 복합적인 경우 메모의 핵심 의도를 우선 판단하세요.
+【title】 메모 핵심 한 줄 요약
+- 메모의 핵심 주제를 15자 이내로 압축
+- 원문을 그대로 쓰지 말 것. 반드시 의미를 추출해서 새로 쓸 것
+- 예: "내일까지 보고서 써야 함" → "캠페인 보고서 마감"
+- 예: "남편이랑 주말에 뭐할지 고민" → "주말 부부 계획 고민"
 
-목표일정 (target_date):
-- 메모에서 날짜/시간 힌트를 추출하세요 (예: "이번 주", "3월 말", "내일", "Q2" 등)
-- 구체적인 날짜로 변환 가능하면 YYYY-MM-DD 형식으로
-- 힌트만 있으면 그대로 텍스트로 (예: "이번 주 금요일", "다음 달")
+【category】 분류
+- "업무": LG유플러스, CRM, 캠페인, 앱푸시, MMS, 데이터분석, KPI, MAU, 고객 메시지 등
+- "개인": 일상, 감정, 건강, 가족, 남편, 고양이 바다, 여행, 취미 등
+- "아이디어": 새 기획, 인사이트, marketerlog, 인스타, 자동화, 부업, 툴 개발 등
+- 복합적이면 핵심 의도 기준으로 판단
+
+【target_date】 목표일정
+- 메모에서 날짜 힌트 추출 후 오늘 날짜 기준으로 YYYY-MM-DD 변환
+- 변환 불가능한 힌트면 텍스트 그대로 (예: "다음 달 초")
 - 없으면 null
 
-to_do 제안 (todos):
-- 메모 내용을 바탕으로 실행 가능한 to-do를 1~3개 제안하세요
+【todos】 다음 액션 제안 (핵심!)
+- 메모 내용을 그대로 반복하지 말 것
+- 메모를 읽고 "그다음에 해야 할 일"을 1~3개 제안
+- 메모에 없는 새로운 관점의 액션이어야 함
+- 구체적이고 실행 가능한 동사로 시작할 것
+- 예시:
+  메모: "클로드로 아이디어 나래비 해보기" →
+  todos: ["AI 아이디어 중 빠르게 실행 가능한 것 1개 선정", "marketerlog 콘텐츠 소재로 연결되는지 검토"]
+  
+  메모: "내일까지 캠페인 보고서 작성" →
+  todos: ["지난 캠페인 데이터 취합", "보고서 초안 구조 잡기"]
 - 없으면 빈 배열 []
-- 형식: ["할 일 1", "할 일 2"]
 
-응답 예시:
+---
+
+응답 형식 (JSON만, 다른 텍스트 없이):
 {
-  "category": "업무",
-  "target_date": "2026-03-31",
-  "todos": ["캠페인 성과 지표 정리", "팀장 보고 슬라이드 작성"]
+  "title": "핵심 한 줄 요약",
+  "category": "업무|개인|아이디어",
+  "target_date": "YYYY-MM-DD 또는 텍스트 또는 null",
+  "todos": ["액션1", "액션2"]
 }
 """
 
 def analyze_memo(text: str) -> dict:
     """Claude API로 메모를 분석해 category, target_date, todos를 반환"""
     try:
+        today = datetime.now(KST).strftime("%Y-%m-%d")
+        user_message = f"[오늘 날짜: {today}]\n\n{text}"
         response = anthropic_client.messages.create(
             model="claude-sonnet-4-5",
             max_tokens=512,
             system=ANALYZE_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": text}],
+            messages=[{"role": "user", "content": user_message}],
         )
         raw = response.content[0].text.strip()
         # JSON 펜스 제거 (혹시 포함되면)
         raw = raw.replace("```json", "").replace("```", "").strip()
         result = json.loads(raw)
         return {
+            "title":       result.get("title", text[:30]),
             "category":    result.get("category", "개인"),
-            "target_date": result.get("target_date"),   # str or None
+            "target_date": result.get("target_date"),
             "todos":       result.get("todos", []),
         }
     except Exception as e:
         logger.error(f"Claude 분석 오류: {e}")
-        return {"category": "개인", "target_date": None, "todos": []}
+        return {"title": text[:30], "category": "개인", "target_date": None, "todos": []}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -105,6 +125,7 @@ def save_to_notion(text: str, analysis: dict) -> bool:
         category   = analysis["category"]
         target_date= analysis["target_date"]
         todos      = analysis["todos"]
+        title      = analysis.get("title", text[:30])  # Claude가 요약한 제목
         todos_text = "\n".join(f"• {t}" for t in todos) if todos else ""
 
         # 목표일정: 날짜 형식이면 date property, 텍스트면 rich_text
@@ -121,7 +142,7 @@ def save_to_notion(text: str, analysis: dict) -> bool:
 
         properties = {
             "구분": {
-                "title": [{"text": {"content": text[:100]}}]
+                "title": [{"text": {"content": title}}]
             },
             "날짜": {
                 "date": {"start": date_str}
