@@ -258,22 +258,30 @@ async def send_morning_briefing(application: Application):
 # ─────────────────────────────────────────────────────────────
 # 메인
 # ─────────────────────────────────────────────────────────────
-def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    # 스케줄러: 매일 7:30 KST (UTC+9 → UTC 22:30 전날)
+async def post_init(application: Application):
+    """봇 시작 후 스케줄러 실행 (event loop 안에서)"""
     scheduler = AsyncIOScheduler(timezone="Asia/Seoul")
     scheduler.add_job(
         send_morning_briefing,
         trigger="cron",
         hour=7,
         minute=30,
-        args=[app],
+        args=[application],
     )
     scheduler.start()
+    logger.info("⏰ 스케줄러 시작 완료")
+
+
+def main():
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("🤖 비서봇 시작!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
