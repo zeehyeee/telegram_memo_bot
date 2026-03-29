@@ -1,209 +1,283 @@
-import asyncio
-import logging
 import os
-from collections import defaultdict
-from datetime import datetime, time, timedelta
+import json
+import logging
+import asyncio
+from datetime import datetime, timezone, timedelta
 
-import pytz
-from dotenv import load_dotenv
+import anthropic
+from notion_client import Client
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from db import Database
-from notion_client_helper import NotionMemo
-
-load_dotenv()
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-KST = pytz.timezone("Asia/Seoul")
-
+# ── 로깅 설정 ────────────────────────────────────────────────
 logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
-db = Database()
-notion = NotionMemo()
+# ── 환경변수 ─────────────────────────────────────────────────
+TELEGRAM_TOKEN      = os.environ["TELEGRAM_TOKEN"]
+TELEGRAM_CHAT_ID    = os.environ["TELEGRAM_CHAT_ID"]   # 본인 chat_id
+NOTION_TOKEN        = os.environ["NOTION_TOKEN"]
+NOTION_DATABASE_ID  = os.environ["NOTION_DATABASE_ID"]
+ANTHROPIC_API_KEY   = os.environ["ANTHROPIC_API_KEY"]
 
-# ── 요약 텍스트 빌더 ──────────────────────────────────────────────────────────
+# ── 클라이언트 초기화 ─────────────────────────────────────────
+notion          = Client(auth=NOTION_TOKEN)
+anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-def build_summary(memos: list[dict], title: str) -> str:
-    text = f"📊 *{title}*\n총 {len(memos)}개의 메모\n\n"
-    for m in memos:
-        text += f"  • {m['text']}\n"
-    return text.strip()
+KST = timezone(timedelta(hours=9))
 
+# ─────────────────────────────────────────────────────────────
+# Claude API: 메모 분석 (분류 + 목표일정 + to-do 제안)
+# ─────────────────────────────────────────────────────────────
+ANALYZE_SYSTEM_PROMPT = """
+당신은 개인 비서봇을 위한 메모 분석 전문가입니다.
+사용자가 보내는 자연어 메모를 읽고 아래 JSON 형식으로만 응답하세요.
+절대 JSON 외 다른 텍스트를 포함하지 마세요.
 
-# ── 핸들러 ────────────────────────────────────────────────────────────────────
+분류 기준 (category):
+- "업무": LG유플러스, CRM, 캠페인, 앱푸시, MMS, 데이터분석, 회사, 마케팅 전략, 보고서, KPI, MAU, 고객, 메시지 등 직장과 관련된 모든 것
+- "개인": 일상, 감정, 개인 목표, 운동, 건강, 가족, 남편, 고양이(바다), 여행, 취미, 집, 식사, 쇼핑 등 사생활과 관련된 것
+- "아이디어": 새로운 기획, 인사이트, marketerlog, 인스타그램 채널, 블로그, 창업, 자동화 아이디어, 부업, 툴 개발 아이디어 등
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "안녕하세요! 메모 봇입니다 🗒️\n\n"
-        "메시지를 보내면 업무/개인/아이디어로 자동 분류하여 저장합니다.\n\n"
-        "📌 *명령어*\n"
-        "/today — 오늘 메모 보기\n"
-        "/yesterday — 어제 메모 보기\n"
-        "/all — 최근 메모 50개\n"
-        "/summary — 어제 메모 요약 받기\n"
-        "/delete `<id>` — 메모 삭제\n"
-        "/myid — 내 채팅 ID 확인",
-        parse_mode="Markdown",
-    )
+※ 분류 기준이 애매하거나 복합적인 경우 메모의 핵심 의도를 우선 판단하세요.
 
+목표일정 (target_date):
+- 메모에서 날짜/시간 힌트를 추출하세요 (예: "이번 주", "3월 말", "내일", "Q2" 등)
+- 구체적인 날짜로 변환 가능하면 YYYY-MM-DD 형식으로
+- 힌트만 있으면 그대로 텍스트로 (예: "이번 주 금요일", "다음 달")
+- 없으면 null
 
-async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"채팅 ID: `{update.effective_chat.id}`", parse_mode="Markdown"
-    )
+to_do 제안 (todos):
+- 메모 내용을 바탕으로 실행 가능한 to-do를 1~3개 제안하세요
+- 없으면 빈 배열 []
+- 형식: ["할 일 1", "할 일 2"]
 
+응답 예시:
+{
+  "category": "업무",
+  "target_date": "2026-03-31",
+  "todos": ["캠페인 성과 지표 정리", "팀장 보고 슬라이드 작성"]
+}
+"""
 
-async def handle_memo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    db.save_memo(update.effective_chat.id, text, "미분류")
-    notion.save(text, "미분류")
-    await update.message.reply_text("📝 메모 저장 완료!")
-
-
-async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    memos = db.get_today_memos(update.effective_chat.id)
-    if not memos:
-        await update.message.reply_text("오늘 저장된 메모가 없습니다.")
-        return
-    date_str = datetime.now(KST).strftime("%Y년 %m월 %d일")
-    await update.message.reply_text(
-        build_summary(memos, f"{date_str} 오늘 메모"), parse_mode="Markdown"
-    )
-
-
-async def cmd_yesterday(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    memos = db.get_yesterday_memos(update.effective_chat.id)
-    if not memos:
-        await update.message.reply_text("어제 저장된 메모가 없습니다.")
-        return
-    date_str = (datetime.now(KST) - timedelta(days=1)).strftime("%Y년 %m월 %d일")
-    await update.message.reply_text(
-        build_summary(memos, f"{date_str} 어제 메모"), parse_mode="Markdown"
-    )
-
-
-async def cmd_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    memos = db.get_all_memos(update.effective_chat.id)
-    if not memos:
-        await update.message.reply_text("저장된 메모가 없습니다.")
-        return
-    lines = []
-    for m in memos:
-        ts = m["created_at"].strftime("%m/%d %H:%M")
-        lines.append(f"`[{m['id']}]` {ts}  {m['text']}")
-    await update.message.reply_text(
-        "📋 *최근 메모 (최대 50개)*\n\n" + "\n".join(lines),
-        parse_mode="Markdown",
-    )
-
-
-async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    memos = db.get_yesterday_memos(update.effective_chat.id)
-    if not memos:
-        await update.message.reply_text("어제 저장된 메모가 없습니다.")
-        return
-    date_str = (datetime.now(KST) - timedelta(days=1)).strftime("%Y년 %m월 %d일")
-    await update.message.reply_text(
-        build_summary(memos, f"{date_str} 메모 요약"), parse_mode="Markdown"
-    )
-
-
-async def cmd_testnotion(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not notion.enabled:
-        await update.message.reply_text("❌ 노션 비활성화 — NOTION_TOKEN 또는 NOTION_DATABASE_ID 환경변수를 확인하세요.")
-        return
+def analyze_memo(text: str) -> dict:
+    """Claude API로 메모를 분석해 category, target_date, todos를 반환"""
     try:
-        from datetime import datetime as dt
-        date_str = dt.now(KST).date().isoformat()
-        notion.client.pages.create(
-            parent={"database_id": notion.database_id},
-            properties={
-                "구분": {"title": [{"text": {"content": "노션 연동 테스트"}}]},
-                "날짜": {"date": {"start": date_str}},
-                "카테고리": {"select": {"name": "미분류"}},
-                "내용": {"rich_text": [{"text": {"content": "노션 연동 테스트"}}]},
-            },
+        response = anthropic_client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=512,
+            system=ANALYZE_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": text}],
         )
-        await update.message.reply_text("✅ 노션 저장 성공! 노션 데이터베이스를 확인하세요.")
+        raw = response.content[0].text.strip()
+        # JSON 펜스 제거 (혹시 포함되면)
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        result = json.loads(raw)
+        return {
+            "category":    result.get("category", "개인"),
+            "target_date": result.get("target_date"),   # str or None
+            "todos":       result.get("todos", []),
+        }
     except Exception as e:
-        await update.message.reply_text(f"❌ 노션 저장 실패\n\n`{type(e).__name__}: {e}`", parse_mode="Markdown")
+        logger.error(f"Claude 분석 오류: {e}")
+        return {"category": "개인", "target_date": None, "todos": []}
 
 
-async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("사용법: /delete `<id>`\n/all 에서 ID를 확인하세요.", parse_mode="Markdown")
-        return
+# ─────────────────────────────────────────────────────────────
+# 노션 저장
+# ─────────────────────────────────────────────────────────────
+def save_to_notion(text: str, analysis: dict) -> bool:
+    """노션 데이터베이스에 메모 저장 (확장 컬럼 포함)"""
     try:
-        memo_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("ID는 숫자여야 합니다.")
-        return
-    if db.delete_memo(memo_id, update.effective_chat.id):
-        await update.message.reply_text(f"메모 #{memo_id} 삭제 완료.")
-    else:
-        await update.message.reply_text(f"메모 #{memo_id}를 찾을 수 없습니다.")
+        now_kst = datetime.now(KST)
+        date_str = now_kst.strftime("%Y-%m-%d")
+
+        category   = analysis["category"]
+        target_date= analysis["target_date"]
+        todos      = analysis["todos"]
+        todos_text = "\n".join(f"• {t}" for t in todos) if todos else ""
+
+        # 목표일정: 날짜 형식이면 date property, 텍스트면 rich_text
+        # → 노션 date 타입은 ISO 형식만 허용하므로 파싱 시도
+        target_date_prop = None
+        if target_date:
+            try:
+                # YYYY-MM-DD 형식 확인
+                datetime.strptime(target_date, "%Y-%m-%d")
+                target_date_prop = {"date": {"start": target_date}}
+            except ValueError:
+                # 텍스트 형식 → rich_text로 저장
+                target_date_prop = None  # 아래에서 처리
+
+        properties = {
+            "구분": {
+                "title": [{"text": {"content": text[:100]}}]
+            },
+            "날짜": {
+                "date": {"start": date_str}
+            },
+            "카테고리": {
+                "select": {"name": category}
+            },
+            "내용": {
+                "rich_text": [{"text": {"content": text}}]
+            },
+        }
+
+        # 목표일정 컬럼
+        if target_date_prop:
+            properties["목표일정"] = target_date_prop
+        elif target_date:
+            # 날짜가 아닌 텍스트 힌트인 경우 (노션에서 해당 컬럼이 rich_text 타입이어야 함)
+            properties["목표일정_메모"] = {
+                "rich_text": [{"text": {"content": target_date}}]
+            }
+
+        # to-do 제안 컬럼
+        if todos_text:
+            properties["To-do 제안"] = {
+                "rich_text": [{"text": {"content": todos_text}}]
+            }
+
+        notion.pages.create(
+            parent={"database_id": NOTION_DATABASE_ID},
+            properties=properties,
+        )
+        return True
+
+    except Exception as e:
+        logger.error(f"노션 저장 오류: {e}")
+        return False
 
 
-# ── 스케줄 작업 ───────────────────────────────────────────────────────────────
-
-async def scheduled_daily_summary(context: ContextTypes.DEFAULT_TYPE):
-    """매일 KST 07:30에 전날 메모 요약 발송."""
-    all_memos = db.get_yesterday_memos_all()
-    if not all_memos:
-        log.info("어제 메모 없음, 요약 발송 생략.")
-        return
-
-    by_chat: dict[int, list] = defaultdict(list)
-    for memo in all_memos:
-        by_chat[memo["chat_id"]].append(memo)
-
-    date_str = (datetime.now(KST) - timedelta(days=1)).strftime("%Y년 %m월 %d일")
-    for chat_id, memos in by_chat.items():
-        try:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=build_summary(memos, f"{date_str} 메모 요약"),
-                parse_mode="Markdown",
-            )
-            log.info("요약 발송 완료: chat_id=%s (%d개)", chat_id, len(memos))
-        except Exception as e:
-            log.error("요약 발송 실패 chat_id=%s: %s", chat_id, e)
-
-
-# ── 메인 ─────────────────────────────────────────────────────────────────────
-
-def main():
-    if not BOT_TOKEN:
-        raise ValueError(".env 파일에 BOT_TOKEN을 설정해주세요.")
-
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("myid", cmd_myid))
-    app.add_handler(CommandHandler("today", cmd_today))
-    app.add_handler(CommandHandler("yesterday", cmd_yesterday))
-    app.add_handler(CommandHandler("all", cmd_all))
-    app.add_handler(CommandHandler("summary", cmd_summary))
-    app.add_handler(CommandHandler("delete", cmd_delete))
-    app.add_handler(CommandHandler("testnotion", cmd_testnotion))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_memo))
-
-    # 매일 KST 07:30 요약 발송
-    app.job_queue.run_daily(
-        scheduled_daily_summary,
-        time=time(hour=7, minute=30, tzinfo=KST),
-        name="daily_summary",
+# ─────────────────────────────────────────────────────────────
+# 텔레그램 핸들러
+# ─────────────────────────────────────────────────────────────
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 비서봇 가동 중!\n\n"
+        "메모를 자유롭게 보내면 Claude가 분류해서 노션에 저장해줘요.\n"
+        "• 업무 / 개인 / 아이디어 자동 분류\n"
+        "• 목표일정 추출\n"
+        "• To-do 제안까지!"
     )
 
-    log.info("봇 시작!")
-    app.run_polling(drop_pending_updates=True)
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """메모 수신 → Claude 분석 → 노션 저장"""
+    text = update.message.text.strip()
+    if not text:
+        return
+
+    # 처리 중 안내
+    processing_msg = await update.message.reply_text("🔍 분석 중...")
+
+    # Claude 분석
+    analysis = analyze_memo(text)
+    category    = analysis["category"]
+    target_date = analysis["target_date"]
+    todos       = analysis["todos"]
+
+    # 노션 저장
+    saved = save_to_notion(text, analysis)
+
+    # 결과 메시지 구성
+    emoji_map = {"업무": "💼", "개인": "🌿", "아이디어": "💡"}
+    emoji = emoji_map.get(category, "📝")
+
+    result_lines = [
+        f"{emoji} **{category}** 으로 저장했어요!",
+    ]
+    if target_date:
+        result_lines.append(f"📅 목표일정: {target_date}")
+    if todos:
+        result_lines.append("✅ To-do 제안:")
+        for t in todos:
+            result_lines.append(f"  • {t}")
+    if not saved:
+        result_lines.append("⚠️ 노션 저장 실패 - 로그 확인 필요")
+
+    await processing_msg.edit_text("\n".join(result_lines), parse_mode="Markdown")
+
+
+# ─────────────────────────────────────────────────────────────
+# 아침 브리핑 (7:30 KST)
+# ─────────────────────────────────────────────────────────────
+async def send_morning_briefing(application: Application):
+    """오늘 날짜 기준 노션 메모 요약 브리핑"""
+    try:
+        today = datetime.now(KST).strftime("%Y-%m-%d")
+
+        response = notion.databases.query(
+            database_id=NOTION_DATABASE_ID,
+            filter={
+                "property": "날짜",
+                "date": {"equals": today}
+            }
+        )
+        pages = response.get("results", [])
+
+        if not pages:
+            msg = f"📋 {today} 오늘 저장된 메모가 없어요."
+        else:
+            by_cat: dict[str, list[str]] = {"업무": [], "개인": [], "아이디어": []}
+            for page in pages:
+                props = page["properties"]
+                cat   = props.get("카테고리", {}).get("select", {})
+                cat   = cat.get("name", "기타") if cat else "기타"
+                title = props.get("구분", {}).get("title", [])
+                title = title[0]["text"]["content"] if title else "(내용 없음)"
+                by_cat.setdefault(cat, []).append(title)
+
+            lines = [f"☀️ {today} 아침 브리핑\n"]
+            emoji_map = {"업무": "💼", "개인": "🌿", "아이디어": "💡"}
+            for cat, items in by_cat.items():
+                if items:
+                    lines.append(f"{emoji_map.get(cat, '📝')} {cat} ({len(items)}건)")
+                    for item in items:
+                        lines.append(f"  • {item[:60]}")
+            msg = "\n".join(lines)
+
+        await application.bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=msg,
+        )
+    except Exception as e:
+        logger.error(f"브리핑 오류: {e}")
+
+
+# ─────────────────────────────────────────────────────────────
+# 메인
+# ─────────────────────────────────────────────────────────────
+def main():
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # 스케줄러: 매일 7:30 KST (UTC+9 → UTC 22:30 전날)
+    scheduler = AsyncIOScheduler(timezone="Asia/Seoul")
+    scheduler.add_job(
+        send_morning_briefing,
+        trigger="cron",
+        hour=7,
+        minute=30,
+        args=[app],
+    )
+    scheduler.start()
+
+    logger.info("🤖 비서봇 시작!")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
-    asyncio.set_event_loop(asyncio.new_event_loop())
     main()
