@@ -10,6 +10,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from db import Database
+from notion_client_helper import NotionMemo
 
 load_dotenv()
 
@@ -23,6 +24,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 db = Database()
+notion = NotionMemo()
 
 # ── 요약 텍스트 빌더 ──────────────────────────────────────────────────────────
 
@@ -59,6 +61,7 @@ async def cmd_myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_memo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     db.save_memo(update.effective_chat.id, text, "미분류")
+    notion.save(text, "미분류")
     await update.message.reply_text("📝 메모 저장 완료!")
 
 
