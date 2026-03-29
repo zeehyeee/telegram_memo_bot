@@ -24,8 +24,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── 환경변수 ─────────────────────────────────────────────────
-TELEGRAM_TOKEN      = os.environ["TELEGRAM_TOKEN"]
-TELEGRAM_CHAT_ID    = os.environ["TELEGRAM_CHAT_ID"]   # 본인 chat_id
+TELEGRAM_TOKEN      = os.environ["BOT_TOKEN"]
+TELEGRAM_CHAT_ID    = os.environ.get("CHAT_ID", os.environ.get("TELEGRAM_CHAT_ID", ""))
 NOTION_TOKEN        = os.environ["NOTION_TOKEN"]
 NOTION_DATABASE_ID  = os.environ["NOTION_DATABASE_ID"]
 ANTHROPIC_API_KEY   = os.environ["ANTHROPIC_API_KEY"]
