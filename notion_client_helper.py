@@ -16,10 +16,16 @@ class NotionMemo:
         if token and self.database_id:
             self.client = Client(auth=token)
             self.enabled = True
+            log.info("노션 연동 활성화 (database_id: %s...)", self.database_id[:8])
         else:
             self.client = None
             self.enabled = False
-            log.warning("NOTION_TOKEN 또는 NOTION_DATABASE_ID 미설정 — 노션 저장 비활성화")
+            missing = []
+            if not token:
+                missing.append("NOTION_TOKEN")
+            if not self.database_id:
+                missing.append("NOTION_DATABASE_ID")
+            log.warning("노션 저장 비활성화 — 환경변수 미설정: %s", ", ".join(missing))
 
     def save(self, text: str, category: str = "미분류") -> bool:
         if not self.enabled:
@@ -45,5 +51,5 @@ class NotionMemo:
             )
             return True
         except Exception as e:
-            log.error("노션 저장 실패: %s", e)
+            log.error("노션 저장 실패 (%s): %s", type(e).__name__, e)
             return False
