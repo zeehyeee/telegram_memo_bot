@@ -2,3 +2,4 @@ python-telegram-bot[job-queue]==21.10
 python-dotenv==1.0.0
 pytz==2024.1
 notion-client==2.3.0
+anthropic
