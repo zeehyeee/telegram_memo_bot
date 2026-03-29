@@ -113,6 +113,27 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_testnotion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not notion.enabled:
+        await update.message.reply_text("❌ 노션 비활성화 — NOTION_TOKEN 또는 NOTION_DATABASE_ID 환경변수를 확인하세요.")
+        return
+    try:
+        from datetime import datetime as dt
+        date_str = dt.now(KST).date().isoformat()
+        notion.client.pages.create(
+            parent={"database_id": notion.database_id},
+            properties={
+                "구분": {"title": [{"text": {"content": "노션 연동 테스트"}}]},
+                "날짜": {"date": {"start": date_str}},
+                "카테고리": {"select": {"name": "미분류"}},
+                "내용": {"rich_text": [{"text": {"content": "노션 연동 테스트"}}]},
+            },
+        )
+        await update.message.reply_text("✅ 노션 저장 성공! 노션 데이터베이스를 확인하세요.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ 노션 저장 실패\n\n`{type(e).__name__}: {e}`", parse_mode="Markdown")
+
+
 async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("사용법: /delete `<id>`\n/all 에서 ID를 확인하세요.", parse_mode="Markdown")
@@ -169,6 +190,7 @@ def main():
     app.add_handler(CommandHandler("all", cmd_all))
     app.add_handler(CommandHandler("summary", cmd_summary))
     app.add_handler(CommandHandler("delete", cmd_delete))
+    app.add_handler(CommandHandler("testnotion", cmd_testnotion))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_memo))
 
     # 매일 KST 07:30 요약 발송
