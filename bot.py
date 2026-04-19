@@ -552,13 +552,13 @@ async def post_init(application: Application):
     # 16:30 — 업무일지 작성 알림 (신규)
     scheduler.add_job(
         send_work_log_reminder,
-        trigger="cron", hour=16, minute=30,
+        trigger="cron", day_of_week="mon-fri", hour=16, minute=30,
         args=[application],
     )
     # 17:30 — 퇴근 후 일상 to-do 알림 (신규)
     scheduler.add_job(
         send_evening_todo,
-        trigger="cron", hour=17, minute=30,
+        trigger="cron", day_of_week="mon-fri", hour=17, minute=30,
         args=[application],
     )
 
